@@ -56,63 +56,135 @@
   		}
   	</style>
   	<script id='query'>
-	    function main() {
-	        return Events({from_date: params.from_date, to_date: params.to_date})
-	        .groupByUser(function(state, events) {
-	            state = state || {sequence: []};
-	            var stateUpdater = function(event) {
-	                if (!params.start_event || params.start_event == event.name)
-	                    state.active = true;
-	                if (state.active && !state.done) {
-	                    state.sequence.push({name: event.name, time: event.time});
-	                    state.propval = event.properties[params.property];
-	                    state.done = event.name == params.end_event;
-	                }
-	            };
-	            _.each(events, stateUpdater);
-	            return state;
-	        })
-	        .filter(function(item) {
-	            return params.end_event? item.value.done && item.value.active : item;
-	        })
-	        .map(function(item) {
-	            var state = item.value;
-	            var end_time = state.sequence.length > 0 ? state.sequence[state.sequence.length - 1].time : false;
-	            var sequenceFilter = function(item) {return end_time - item.time < params.conversion_length;};
-	            return {sequence: _.chain(state.sequence)
-	                               .filter(sequenceFilter)
-	                               .pluck('name')
-	                               .value(),
-	                    group: state.propval? state.propval : 'No Property'};
-	        })
-	        .filter(function(item) {
-	            return !((params.start_event && item.sequence[0] != params.start_event)
-	                   ||(params.end_event && item.sequence[item.sequence.length - 1] != params.end_event)
-	                   ||(params.min_length && item.sequence.length < params.min_length)
-	                   ||(params.max_length && item.sequence.length > params.max_length));
-	        })
-	        .groupBy([function(item) {return item.sequence;}, function(item) {return item.group;}], mixpanel.reducer.count())
-	        .groupBy([function(item) {return item.key[item.key.length - 1];}], mixpanel.reducer.top(params.num_results))
-	        .map(function(item) {
-	            var removeLast = function(result) {result.key.pop();};
-	            _.each(item.value, removeLast);
-	            return item;
-	        });
-	    }
-    </script>
+		function filterOutPeopleWithNoEvents(item) {
+		    return item.event;
+		}
+
+		function createStateWithPeople(state, items) {
+		    state = state || {sequence: []};
+		    var stateUpdater = function(item) {
+		        var event = item.event;
+		        if (!params.start_event || params.start_event == event.name)
+		            state.active = true;
+		        if (state.active && !state.done) {
+		            state.sequence.push({name: event.name, time: event.time});
+		            state.propval = item.user? item.user.properties[params.people_prop] : false;
+		            state.done = event.name == params.end_event;
+		        }
+		    };
+		    var filteredItems = _.filter(items, function(item) {return item.event.name != '$campaign_delivery';});
+		    _.each(filteredItems, stateUpdater);
+		    return state;
+		}
+
+		function createState(state, events) {
+		    state = state || {sequence: []};
+		    var stateUpdater = function(event) {
+		        if (!params.start_event || params.start_event == event.name)
+		            state.active = true;
+		        if (state.active && !state.done) {
+		            state.sequence.push({name: event.name, time: event.time});
+		            state.propval = event.properties[params.property];
+		            state.done = event.name == params.end_event;
+		        }
+		    };
+		    var filteredEvents = _.filter(events, function(event) {return event.name != '$campaign_delivery';});
+		    _.each(filteredEvents, stateUpdater);
+		    if (!params.property)
+		        state.propval = 'No Property';
+		    return state;
+		}
+
+		function filterForEndEvent(item) {
+		    return params.end_event? item.value.done && item.value.active : item;
+		}
+
+		function mapToSequence(item) {
+		    var state = item.value;
+		    var end_time = state.sequence.length > 0 ? state.sequence[state.sequence.length - 1].time : false;
+		    var sequenceFilter = function(item) {return end_time - item.time < params.conversion_length;};
+		    return {sequence: _.chain(state.sequence)
+		                       .filter(sequenceFilter)
+		                       .pluck('name')
+		                       .value(),
+		            property: state.propval? state.propval : 'No Property'};
+		}
+
+		function filterToRelevantSequences(item) {
+		    return !((params.start_event && item.sequence[0] != params.start_event)
+		           ||(params.end_event && item.sequence[item.sequence.length - 1] != params.end_event)
+		           ||(params.min_length && item.sequence.length < params.min_length)
+		           ||(params.max_length && item.sequence.length > params.max_length));
+		}
+
+		function getKey(item) {
+		    return item.key[item.key.length - 1];
+		}
+
+		function theTop(n) {
+		    return function(accumulators, items) {
+		        var count = 0;
+		        var countAdder = function(value) {count += value};
+		        _.chain(items)
+		         .pluck('value')
+		         .each(countAdder);
+		        _.chain(accumulators)
+		         .pluck('count')
+		         .each(countAdder);
+		        return {results: _.pluck(accumulators, 'results')
+		                          .reduce(function(a,b) {return a.concat(b);},[])
+		                          .concat(items)
+		                          .sort(function(a, b) {return b.value - a.value;})
+		                          .slice(0, n),
+		                count: count};
+		    };
+		}
+
+		function mapToFinalResult(item) {
+		    var removeLastAndAddPercentage = function(result) {
+		        result.key.pop();
+		        result.percentage = Math.round(result.value * 1000 / item.value.count) / 10;
+		        result.sequence = result.key;
+		        result.count = result.value;
+		        delete result.value;
+		        delete result.key;
+		    };
+		    _.each(item.value.results, removeLastAndAddPercentage);
+		    item.key = {property: item.key[0], count: item.value.count};
+		    item.value = item.value.results;
+		    return item;
+		}
+
+		function main() {
+		    if (params.people_prop) {
+		        return join(Events({from_date: params.from_date, to_date: params.to_date}), People())
+		        .filter(filterOutPeopleWithNoEvents)
+		        .groupByUser(createStateWithPeople)
+		        .filter(filterForEndEvent)
+		        .map(mapToSequence)
+		        .filter(filterToRelevantSequences)
+		        .groupBy(['sequence', 'property'], mixpanel.reducer.count())
+		        .groupBy([getKey], theTop(params.num_results))
+		        .map(mapToFinalResult);
+		    }
+		    else {
+		        return Events({from_date: params.from_date, to_date: params.to_date})
+		        .groupByUser(createState)
+		        .filter(filterForEndEvent)
+		        .map(mapToSequence)
+		        .filter(filterToRelevantSequences)
+		        .groupBy(['sequence', 'property'], mixpanel.reducer.count())
+		        .groupBy([getKey], theTop(params.num_results))
+		        .map(mapToFinalResult);
+		    }
+		}
+  	</script>
   	<div class="mixpanel-platform-section">
   	  <div class="header" style="display:flex;justify-content:center;align-items:center;width:695px;">Most Common User Flows</div>
   	  <div class="dropdown-section">
   	  	<div class="select left">
       		<div class="dropdown-label">Date range:</div>
       		<div id="dateSelect"></div>
-      	</div>	
-      </div>
-      <div class="dropdown-section">
-      	<div class="select left">
-      		<div class="dropdown-label">Session length:</div>
-      		<div id="timeSelect"></div>
-      		<div id="unitSelect"></div>
       	</div>
       	<div class="select right">
       		<div class="dropdown-label">Start Event:</div>
@@ -121,13 +193,24 @@
       </div>
       <div class="dropdown-section">
       	<div class="select left">
-      		<div class="dropdown-label">Count between:</div>
-      		<div id="minLengthSelect"></div>
-      		<div id="maxLengthSelect"></div>
+      		<div class="dropdown-label">Session length:</div>
+      		<div id="timeSelect"></div>
+      		<div id="unitSelect"></div>
       	</div>
       	<div class="select right">
       		<div class="dropdown-label">End Event:</div>
       		<div id="eventSelect"></div>
+      	</div>
+      </div>
+      <div class="dropdown-section">
+      	<div class="select left">
+      		<div class="dropdown-label">Sequence Length (# events):</div>
+      		<div id="minLengthSelect"></div>
+      		<div id="maxLengthSelect"></div>
+      	</div>
+      	<div class="select right">
+      		<div class="dropdown-label">Property:</div>
+      		<div id="propSelect"></div>
       	</div>     	
       </div>
       <div class="dropdown-section">
@@ -136,8 +219,8 @@
       		<div id="numResultsSelect"></div>  		
       	</div>
       	<div class="select right">
-      		<div class="dropdown-label">Property:</div>
-      		<div id="propSelect"></div>
+      		<div class="dropdown-label">People Property: (overwrites property)</div>
+      		<div id="peoplePropSelect"></div>
       	</div>
       </div>
     </div>
@@ -152,17 +235,18 @@
 		time_unit.val(86400000);
 		var min_sequence_length = $('#minLengthSelect').MPSelect({items: items(1,2,3,4,5,6,7,8,9,10)});
 		var max_sequence_length = $('#maxLengthSelect').MPSelect({items: items(1,2,3,4,5,6,7,8,9,10)});
-		min_sequence_length.val(2);
-		max_sequence_length.val(8);
+		min_sequence_length.val(1);
+		max_sequence_length.val(5);
 		var max_results = $('#numResultsSelect').MPSelect({items: items(2, 5, 10, 15, 50)});
 		max_results.val(5);
 		var start_event = $('#startEventSelect').MPEventSelect();
 		var finish_event = $('#eventSelect').MPEventSelect();
 		var property = $('#propSelect').MPPropertySelect();
 		property.MPPropertySelect('setEvent');
+		var peopleProperty = 0;
 		function runQuery() {
-			$('.select_button:not(#eventSelect > .select_button, #propSelect > .select_button, #startEventSelect > .select_button)').addClass('small');
-			$('.select_menu:not(#eventSelect > .select_menu, #propSelect > .select_menu, #startEventSelect > .select_menu)').addClass('small');
+			$('.select_button:not(#eventSelect > .select_button, #propSelect > .select_button, #startEventSelect > .select_button, #peoplePropSelect > .select_button)').addClass('small');
+			$('.select_menu:not(#eventSelect > .select_menu, #propSelect > .select_menu, #startEventSelect > .select_menu, #peoplePropSelect > .select_menu)').addClass('small');
 			$('#numResultsSelect, #minLengthSelect, #timeSelect, #unitSelect, #maxLengthSelect').css({'display': 'inline-block', 'max-width': '50px'})
 			var params = {
 			    'from_date': dateSelect.MPDatepicker('value').from.toISOString().slice(0, -14),
@@ -173,32 +257,39 @@
 			    'num_results': max_results.MPSelect('value'),
 			    'start_event': start_event.MPEventSelect('value'),
 			    'end_event': finish_event.MPEventSelect('value'),
-			    'property': property.MPPropertySelect('value')
+			    'property': property.MPPropertySelect('value'),
+			    'people_prop' : peopleProperty == 0? null: peopleProperty.MPSelect('value')
 			};
 			MP.api.custom_query(script, params).done(function(results) {
+				console.log(results);
 				var res = [];
 				if (results.length > 0) {
 					for (var i = 0; i < params.num_results; i++) {
 						res.push({});
 					}
-					_.each(results, function(item) {
-		                var propval = item.key[0];
+					var resultMapper = function(item) {
+		                var propval = item.key.property + ' (' + item.key.count + ')';
 		                for (i = 0; i < params.num_results; i++) {
 		                    var result = 'no flow';
 		                    if (item.value[i])
-		                        result = item.value[i].value + ': ' + item.value[i].key;
+		                        result = item.value[i].count + ' (' + item.value[i].percentage + '%): ' + item.value[i].sequence;
 		                    res[i][propval] = result;
 		                }
-		            });
-					console.log(res);
+		            };
+		            _.each(results, resultMapper);
 					res.unshift('');
 					delete res[0];
 				}
-				console.log(res);
 			    eventTable.MPTable('setData', res);
 			});
 		}
 		runQuery();
+		MP.api.query('/api/2.0/engage/properties').done(function(json) {
+    		var items = _.map(json.results, function(item, key) {return {label: key, value: key};})
+    		items.unshift({label:'-- Select a people property --', value: undefined});
+    		peopleProperty = $('#peoplePropSelect').MPSelect({items: items});
+    		peopleProperty.on('change', function() {runQuery();});
+    	});
 		dateSelect.on('change', function() {runQuery();});
 		time_length.on('change', function(e, selection) {runQuery();});
 		time_unit.on('change', function(e, selection) {runQuery();});
